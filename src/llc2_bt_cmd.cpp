@@ -12,12 +12,6 @@
 #include <lldb/API/SBTarget.h>
 #include <lldb/API/SBThread.h>
 
-#include <lldb/Target/ExecutionContext.h>
-#include <lldb/Target/Process.h>
-#include <lldb/Target/RegisterContext.h>
-#include <lldb/Target/StackFrame.h>
-#include <lldb/Target/Thread.h>
-
 namespace llc2 {
 
 namespace {
@@ -33,15 +27,6 @@ constexpr std::string_view kUserverWrappedCallImplMark =
 constexpr std::string_view kFoundCoroutineMessage =
     "\n---------------------------- found sleeping coroutine "
     "----------------------------";
-
-class LLC2Frame : public lldb::SBFrame {
- public:
-  LLC2Frame(const lldb::SBFrame& other) : lldb::SBFrame{other} {}
-
-  lldb::StackFrameSP GetNativeFrame() const { return GetFrameSP(); }
-
-  lldb::ThreadSP GetNativeThread() const { return m_opaque_sp->GetThreadSP(); }
-};
 
 enum class state_t : unsigned int {
   none = 0,
@@ -211,24 +196,46 @@ bool BacktraceCmd::DoExecute(lldb::SBDebugger debugger, char**,
 
     auto context_ptr = TryFindCoroContext(process, result, region_info);
     if (context_ptr != nullptr) {
-      LLC2Frame hack{thread.GetSelectedFrame()};
+      auto frame = thread.GetSelectedFrame();
+      auto registers = frame.GetRegisters();
+      auto gpr_registers =
+          registers.GetFirstValueByName("General Purpose Registers");
 
-      auto registers = hack.GetNativeFrame()->GetRegisterContext();
-      const auto old_fp = registers->GetFP();
-      const auto old_sp = registers->GetSP();
-      const auto old_pc = registers->GetPC();
+      const auto upd_register = [&gpr_registers, &result](
+                                    const char* reg_name,
+                                    std::int64_t reg_value) {
+        auto reg_sb_value = gpr_registers.GetChildMemberWithName(reg_name);
+
+        lldb::SBData data{};
+        data.SetDataFromSInt64Array(&reg_value, 1);
+
+        const auto prev = reg_sb_value.GetValueAsSigned();
+
+        lldb::SBError error{};
+        reg_sb_value.SetData(data, error);
+        if (!error.Success()) {
+          result.Printf("Failed to update '%s' register\n", reg_name);
+        }
+
+        return prev;
+      };
 
       const auto& gregs = context_ptr->uc_mcontext.gregs;
-      registers->SetFP(gregs[REG_RBP]);
-      registers->SetSP(gregs[REG_RSP]);
-      registers->SetPC(gregs[REG_RIP]);
+      const auto old_rbp = upd_register("rbp", gregs[REG_RBP]);
+      const auto old_rsp = upd_register("rsp", gregs[REG_RSP]);
+      const auto old_rip = upd_register("rip", gregs[REG_RIP]);
 
-      // debugger.HandleCommand("bt");
+      frame.SetPC(gregs[REG_RIP]);
       BacktraceCoroutine(thread, result);
 
-      registers->SetFP(old_fp);
-      registers->SetSP(old_sp);
-      registers->SetPC(old_pc);
+      frame = thread.GetSelectedFrame();
+      registers = frame.GetRegisters();
+      gpr_registers =
+          registers.GetFirstValueByName("General Purpose Registers");
+      upd_register("rbp", old_rbp);
+      upd_register("rsp", old_rsp);
+      upd_register("rip", old_rip);
+      frame.SetPC(old_rip);
     }
   }
 
