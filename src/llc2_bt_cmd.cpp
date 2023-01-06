@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <lldb/API/SBMemoryRegionInfo.h>
 #include <lldb/API/SBMemoryRegionInfoList.h>
@@ -26,6 +27,32 @@ constexpr std::string_view kUserverSleepMark =
 constexpr std::string_view kUserverWrappedCallImplMark =
     "utils::impl::WrappedCallImpl<";
 
+struct RegionInfo final {
+  std::uintptr_t begin{};
+  std::uintptr_t end{};
+};
+
+std::vector<RegionInfo> GetProcessMemoryRegions(
+    lldb::SBProcess& process, lldb::SBCommandReturnObject& result) {
+  auto lldb_regions = process.GetMemoryRegions();
+
+  std::vector<RegionInfo> regions(lldb_regions.GetSize());
+  for (std::uint32_t i = 0; i < lldb_regions.GetSize(); ++i) {
+    lldb::SBMemoryRegionInfo region_info{};
+    if (!lldb_regions.GetMemoryRegionAtIndex(i, region_info)) {
+      result.Printf("Failed to get memory region info at index %u\n", i);
+      continue;
+    }
+    regions[i].begin = region_info.GetRegionBase();
+    regions[i].end = region_info.GetRegionEnd();
+  }
+
+  std::sort(
+      regions.begin(), regions.end(),
+      [](const auto& lhs, const auto& rhs) { return lhs.begin < rhs.begin; });
+  return regions;
+}
+
 enum class state_t : unsigned int {
   none = 0,
   complete = 1 << 1,
@@ -37,7 +64,7 @@ enum class state_t : unsigned int {
 struct CoroControlBlockWithMagic final {
   std::size_t magic{0};
   void* fiber{};
-  void* other{};
+  void* other{};  // this is pull_coroutine
   state_t state{};
   void* except{};  // this is std::exception_ptr
 
@@ -47,20 +74,19 @@ struct CoroControlBlockWithMagic final {
 // This struct mimics that of boost.Coroutine2
 struct CoroControlBlock final {
   void* fiber{};
-  void* other{};
+  void* other{};  // this is pull_coroutine
   state_t state{};
   void* except{};  // this is std::exception_ptr
 };
 
 void* GetFiberPointer(lldb::SBProcess& process,
                       lldb::SBCommandReturnObject& result,
-                      lldb::SBMemoryRegionInfo& region_info, void* sp,
+                      const RegionInfo& region_info, void* sp,
                       const LLC2Settings& settings) {
   if (settings.with_magic) {
     const auto remaining_size =
         GetSettings()->GetMmapSize() -
-        (reinterpret_cast<char*>(region_info.GetRegionEnd()) -
-         static_cast<char*>(sp));
+        (reinterpret_cast<char*>(region_info.end) - static_cast<char*>(sp));
     const auto expected_magic = CoroControlBlockWithMagic::kMagic ^
                                 reinterpret_cast<std::uintptr_t>(sp) ^
                                 remaining_size;
@@ -99,31 +125,29 @@ void* GetFiberPointer(lldb::SBProcess& process,
   }
 }
 
-std::unique_ptr<ucontext_t> TryFindCoroContext(
+// We only need 3 registers to unwind: rsp, rbp and rip.
+// This is all x86_64 ofc.
+struct UnwindRegisters final {
+  std::int64_t rsp{};  // stack pointer
+  std::int64_t rbp{};  // frame pointer
+  std::int64_t rip{};  // instruction pointer
+
+  UnwindRegisters(std::int64_t rsp, std::int64_t rbp, std::int64_t rip)
+      : rsp{rsp}, rbp{rbp}, rip{rip} {}
+
+  UnwindRegisters(const ucontext_t& ucontext)
+      : rsp{ucontext.uc_mcontext.gregs[REG_RSP]},
+        rbp{ucontext.uc_mcontext.gregs[REG_RBP]},
+        rip{ucontext.uc_mcontext.gregs[REG_RIP]} {}
+};
+
+std::unique_ptr<UnwindRegisters> TryGetRegistersFromUcontext(
     lldb::SBProcess& process, lldb::SBCommandReturnObject& result,
-    lldb::SBMemoryRegionInfo& region_info) {
-  // We validated that settings aren't null
-  const auto& settings = *GetSettings();
-
-  constexpr std::size_t func_alignment = 64;  // alignof( ControlBlock);
-  const std::size_t func_size = settings.with_magic
-                                    ? sizeof(CoroControlBlockWithMagic)
-                                    : sizeof(CoroControlBlock);
-
-  // reserve space on stack
-  void* sp = reinterpret_cast<char*>(region_info.GetRegionEnd()) - func_size -
-             func_alignment;
-  // align sp pointer
-  std::size_t space = func_size + func_alignment;
-  sp = std::align(func_alignment, func_size, sp, space);
-
-  void* fiber_ptr = GetFiberPointer(process, result, region_info, sp, settings);
-  if (fiber_ptr == nullptr) {
-    return nullptr;
-  }
-
+    void* fiber_ptr) {
   lldb::SBError error{};
   ucontext_t context{};
+  // fiber_ptr points to fiber_activation_record, which has ucontext_t as the
+  // first field. We hope that compiler doesn't reorder fields in the struct.
   // TODO : what's the deal with +8 here?
   process.ReadMemory(reinterpret_cast<std::uintptr_t>(fiber_ptr) + 8, &context,
                      sizeof(ucontext_t), error);
@@ -133,7 +157,86 @@ std::unique_ptr<ucontext_t> TryFindCoroContext(
     return nullptr;
   }
 
-  return std::make_unique<ucontext_t>(std::move(context));
+  return std::make_unique<UnwindRegisters>(context);
+}
+
+// clang-format off
+/****************************************************************************************
+ *                                                                                      *
+ *  ----------------------------------------------------------------------------------  *
+ *  |    0    |    1    |    2    |    3    |    4     |    5    |    6    |    7    |  *
+ *  ----------------------------------------------------------------------------------  *
+ *  |   0x0   |   0x4   |   0x8   |   0xc   |   0x10   |   0x14  |   0x18  |   0x1c  |  *
+ *  ----------------------------------------------------------------------------------  *
+ *  | fc_mxcsr|fc_x87_cw|        R12        |         R13        |        R14        |  *
+ *  ----------------------------------------------------------------------------------  *
+ *  ----------------------------------------------------------------------------------  *
+ *  |    8    |    9    |   10    |   11    |    12    |    13   |    14   |    15   |  *
+ *  ----------------------------------------------------------------------------------  *
+ *  |   0x20  |   0x24  |   0x28  |  0x2c   |   0x30   |   0x34  |   0x38  |   0x3c  |  *
+ *  ----------------------------------------------------------------------------------  *
+ *  |        R15        |        RBX        |         RBP        |        RIP        |  *
+ *  ----------------------------------------------------------------------------------  *
+ *                                                                                      *
+ ****************************************************************************************/
+// clang-format on
+std::unique_ptr<UnwindRegisters> TryGetRegistersFromFcontext(
+    lldb::SBProcess& process, lldb::SBCommandReturnObject& result,
+    void* fiber_ptr) {
+  constexpr std::size_t kContextDataSize = 0x40;
+
+  // so fiber_ptr is a detail::fcontext_t, which in turn is just a void*.
+  char data[kContextDataSize];
+  lldb::SBError error{};
+  process.ReadMemory(reinterpret_cast<std::uintptr_t>(fiber_ptr), &data,
+                     kContextDataSize, error);
+  if (!error.Success()) {
+    result.Printf("Failed to read fcontext from process memory: %s\n",
+                  error.GetCString());
+    return nullptr;
+  }
+
+  const auto read_with_offset = [&data](std::size_t offset) {
+    return *reinterpret_cast<std::int64_t*>(&data[offset]);
+  };
+
+  // with fcontext fiber_ptr is just the stack pointer
+  const auto rsp = reinterpret_cast<std::int64_t>(fiber_ptr);
+  const auto rbp = read_with_offset(0x30);
+  const auto rip = read_with_offset(0x38);
+
+  return std::make_unique<UnwindRegisters>(rsp, rbp, rip);
+}
+
+std::unique_ptr<UnwindRegisters> TryFindCoroRegisters(
+    lldb::SBProcess& process, lldb::SBCommandReturnObject& result,
+    const RegionInfo& region_info) {
+  // We validated that settings aren't null
+  const auto& settings = *GetSettings();
+
+  constexpr std::size_t func_alignment = 64;  // alignof( ControlBlock);
+  const std::size_t func_size = settings.with_magic
+                                    ? sizeof(CoroControlBlockWithMagic)
+                                    : sizeof(CoroControlBlock);
+
+  // reserve space on stack
+  void* sp =
+      reinterpret_cast<char*>(region_info.end) - func_size - func_alignment;
+  // align sp pointer
+  std::size_t space = func_size + func_alignment;
+  sp = std::align(func_alignment, func_size, sp, space);
+  // sp is where coroutine::control_block is allocated on stack
+
+  void* fiber_ptr = GetFiberPointer(process, result, region_info, sp, settings);
+  if (fiber_ptr == nullptr) {
+    return nullptr;
+  }
+
+  if (settings.context_implementation == ContextImplementation::kUcontext) {
+    return TryGetRegistersFromUcontext(process, result, fiber_ptr);
+  } else {
+    return TryGetRegistersFromFcontext(process, result, fiber_ptr);
+  }
 }
 
 std::string GetFullWidth(std::string_view what) {
@@ -153,7 +256,7 @@ void BacktraceCoroutine(lldb::SBThread& current_thread,
   const auto num_frames = current_thread.GetNumFrames();
 
   bool has_sleep = false;
-  int wrapped_call_frame = 0;
+  int wrapped_call_frame = num_frames;
   for (int i = 0; i < num_frames; ++i) {
     auto frame = current_thread.GetFrameAtIndex(i);
     const auto* display_name = frame.GetDisplayFunctionName();
@@ -234,23 +337,17 @@ bool BacktraceCmd::DoExecute(lldb::SBDebugger debugger, char**,
     }
     auto thread = process.GetSelectedThread();
 
-    auto memory_regions = target.GetProcess().GetMemoryRegions();
-    for (std::uint32_t i = 0; i < memory_regions.GetSize(); ++i) {
-      lldb::SBMemoryRegionInfo region_info{};
-      if (!memory_regions.GetMemoryRegionAtIndex(i, region_info)) {
-        result.Printf("Failed to get memory region info at index %u\n", i);
-        return false;
-      }
-
-      const auto length =
-          region_info.GetRegionEnd() - region_info.GetRegionBase();
+    const auto memory_regions = GetProcessMemoryRegions(process, result);
+    for (const auto& memory_region : memory_regions) {
+      const auto length = memory_region.end - memory_region.begin;
       // TODO : settings.stack_size
       if (length != settings_ptr->GetRealStackSize()) {
         continue;
       }
 
-      auto context_ptr = TryFindCoroContext(process, result, region_info);
-      if (context_ptr != nullptr) {
+      auto unwind_registers_ptr =
+          TryFindCoroRegisters(process, result, memory_region);
+      if (unwind_registers_ptr != nullptr) {
         auto frame = thread.GetSelectedFrame();
         auto registers = frame.GetRegisters();
         auto gpr_registers =
@@ -275,13 +372,13 @@ bool BacktraceCmd::DoExecute(lldb::SBDebugger debugger, char**,
           return prev;
         };
 
-        const auto& gregs = context_ptr->uc_mcontext.gregs;
-        const auto old_rbp = upd_register("rbp", gregs[REG_RBP]);
-        const auto old_rsp = upd_register("rsp", gregs[REG_RSP]);
-        const auto old_rip = upd_register("rip", gregs[REG_RIP]);
+        const auto& regs = *unwind_registers_ptr;
+        const auto old_rsp = upd_register("rsp", regs.rsp);
+        const auto old_rbp = upd_register("rbp", regs.rbp);
+        const auto old_rip = upd_register("rip", regs.rip);
 
-        frame.SetPC(gregs[REG_RIP]);
-        BacktraceCoroutine(thread, result);
+        frame.SetPC(regs.rip);
+        BacktraceCoroutine(thread, result, false);
 
         frame = thread.GetSelectedFrame();
         registers = frame.GetRegisters();
