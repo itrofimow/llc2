@@ -36,20 +36,20 @@ enum class state_t : unsigned int {
 // This struct mimics that of boost.Coroutine2
 struct CoroControlBlockWithMagic final {
   std::size_t magic{0};
-  void* fiber;
-  void* other;
-  state_t state;
-  std::exception_ptr except;
+  void* fiber{};
+  void* other{};
+  state_t state{};
+  void* except{};  // this is std::exception_ptr
 
   static constexpr std::size_t kMagic = 0x12345678;
 };
 
 // This struct mimics that of boost.Coroutine2
 struct CoroControlBlock final {
-  void* fiber;
-  void* other;
-  state_t state;
-  std::exception_ptr except;
+  void* fiber{};
+  void* other{};
+  state_t state{};
+  void* except{};  // this is std::exception_ptr
 };
 
 void* GetFiberPointer(lldb::SBProcess& process,
