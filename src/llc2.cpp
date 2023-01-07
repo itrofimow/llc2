@@ -13,7 +13,8 @@ bool PluginInitialize(lldb::SBDebugger debugger) {
       "-c              context implementation (ucontext|fcontext)\n"
       "-m              with coroutine signing magic\n"
       "-f              only show coroutines which have this in their trace\n"
-      "-t              truncate coroutine stack when this is met\n");
+      "-t              truncate coroutine stack when this is met\n",
+      "llc2 init -s 262144 -c fcontext\n");
 
   llc2.AddCommand(
       "bt", new llc2::BacktraceCmd{},
@@ -21,7 +22,8 @@ bool PluginInitialize(lldb::SBDebugger debugger) {
       "-f              print full backtrace (with locals and arguments)\n"
       "-s              only backtrace coroutine with this stack address "
       "(in hexadecimal base). stack address can be found in output of "
-      "prior 'llc2 bt'\n");
+      "prior 'llc2 bt'\n",
+      "llc2 bt -s 0x7ffff7f07000 -f\n");
 
   return true;
 }
