@@ -13,9 +13,11 @@ bool PluginInitialize(lldb::SBDebugger debugger) {
       "-c              context implementation (ucontext|fcontext)\n"
       "-m              with coroutine signing magic\n"
       "-f              only show coroutines which have this in their trace\n"
-      "-t              truncate coroutine stack when this is met.\n");
+      "-t              truncate coroutine stack when this is met\n");
 
-  llc2.AddCommand("bt", new llc2::BacktraceCmd{}, "bt");
+  // TODO : add some options
+  llc2.AddCommand("bt", new llc2::BacktraceCmd{},
+                  "Print backtrace of all currently sleeping coroutines\n");
   return true;
 }
 }  // namespace lldb

@@ -42,3 +42,20 @@ Install lldb development headers (liblldb-XX-dev) of matching lldb version, <br>
 fix include_directories in CMakeLists.txt (yes i was too lazy to automate it) and then <br>
 `mkdir build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make` <br>
 Now you have a `libllc2.so` and should be able to `plugin load` it into lldb.
+
+### Limitations
+
+* Only works
+  with [protected_fixedsize](https://www.boost.org/doc/libs/1_81_0/libs/coroutine2/doc/html/coroutine2/stack/protected_fixedsize.html)
+* Some of `llc2 init` options are completely ignored: `-f`, `-t`. They are hardcoded to uServer-specific values for now.
+* Might not work with different versions of boost.Coroutine2
+* Might accidentally not work at all
+
+### llc2 init
+
+Supported options:
+
+* `-s` - stack size of a coroutine. For `uServer` it should be either default value of 256Kb or that specified
+  in `static_config.yaml`
+* `-c` - context implementation, either `ucontext` or `fcontext`. For `uServer` it should be `fcontext`, until the
+  binary is built with sanitizers, then `ucontext`.
