@@ -3,6 +3,7 @@
 #include "settings.hpp"
 
 #include <sys/ucontext.h>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -347,6 +348,30 @@ BtSettings ParseBtSettings(char** cmd) {
   return result;
 }
 
+std::chrono::steady_clock::time_point Now() {
+  return std::chrono::steady_clock::now();
+}
+
+void PrintDuration(lldb::SBCommandReturnObject& result, const std::string& name,
+                   std::chrono::steady_clock::time_point start,
+                   std::chrono::steady_clock::time_point finish) {
+  result.Printf(
+      "%s duration: %lu ms\n", name.data(),
+      std::chrono::duration_cast<std::chrono::milliseconds>(finish - start)
+          .count());
+}
+
+struct ScopeTimer final {
+  std::string name;
+  std::chrono::steady_clock::time_point start;
+  lldb::SBCommandReturnObject& result;
+
+  ScopeTimer(lldb::SBCommandReturnObject& result, std::string name)
+      : name{std::move(name)}, start{Now()}, result{result} {}
+
+  ~ScopeTimer() { PrintDuration(result, name, start, Now()); }
+};
+
 }  // namespace
 
 bool BacktraceCmd::RealExecute(lldb::SBDebugger debugger, char** cmd,
@@ -372,6 +397,7 @@ bool BacktraceCmd::RealExecute(lldb::SBDebugger debugger, char** cmd,
   }
   auto thread = process.GetSelectedThread();
 
+  ScopeTimer total{result, "llc2 bt"};
   const auto memory_regions = GetProcessMemoryRegions(process, result);
   for (const auto& memory_region : memory_regions) {
     const auto length = memory_region.end - memory_region.begin;

@@ -22,7 +22,7 @@ bool PluginInitialize(lldb::SBDebugger debugger) {
       "-s              only backtrace coroutine with this stack address "
       "(in hexadecimal base). stack address can be found in output of "
       "prior 'llc2 bt'\n");
-  
+
   return true;
 }
 }  // namespace lldb
