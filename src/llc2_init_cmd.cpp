@@ -4,8 +4,8 @@
 
 namespace llc2 {
 
-bool InitCmd::DoExecute(lldb::SBDebugger, char** cmd,
-                        lldb::SBCommandReturnObject& result) {
+bool InitCmd::RealExecute(lldb::SBDebugger, char** cmd,
+                          lldb::SBCommandReturnObject& result) {
   ParseSettings(cmd);
 
   auto* settings_ptr = GetSettings();

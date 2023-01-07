@@ -3,7 +3,7 @@
 #include "settings.hpp"
 
 #include <sys/ucontext.h>
-#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -251,9 +251,9 @@ std::string GetFullWidth(std::string_view what) {
   return dashes + " " + what.data() + " " + dashes;
 }
 
-void BacktraceCoroutine(lldb::SBThread& current_thread,
-                        lldb::SBCommandReturnObject& result,
-                        bool full = false) {
+void BacktraceCoroutine(std::uintptr_t stack_address,
+                        lldb::SBThread& current_thread,
+                        lldb::SBCommandReturnObject& result, bool full) {
   const auto num_frames = current_thread.GetNumFrames();
 
   bool has_sleep = false;
@@ -304,6 +304,8 @@ void BacktraceCoroutine(lldb::SBThread& current_thread,
 
   const auto found_coroutine_title = GetFullWidth("found sleeping coroutine");
   result.AppendMessage(found_coroutine_title.data());
+  result.Printf("coro stack address: %p\n",
+                reinterpret_cast<void*>(stack_address));
 
   lldb::SBStream result_stream{};
   for (int i = 0; i < wrapped_call_frame; ++i) {
@@ -317,89 +319,121 @@ void BacktraceCoroutine(lldb::SBThread& current_thread,
   result.Printf("%s", result_stream.GetData());
 }
 
+struct BtSettings final {
+  bool full{false};
+  std::optional<std::uintptr_t> stack_address;
+};
+
+BtSettings ParseBtSettings(char** cmd) {
+  BtSettings result{};
+  for (auto** p = cmd; p != nullptr && *p != nullptr; ++p) {
+    const auto* s = *p;
+    if (std::strcmp(s, "-f") == 0) {
+      result.full = true;
+      continue;
+    }
+    if (std::strcmp(s, "-s") == 0) {
+      if ((p + 1) != nullptr && *(p + 1) != nullptr) {
+        const std::string_view v{*(p + 1)};
+        char* end = nullptr;
+        result.stack_address.emplace(std::strtoul(v.data(), &end, 16));
+        if (end != v.data() + v.size()) {
+          result.stack_address.reset();
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
 }  // namespace
 
-bool BacktraceCmd::DoExecute(lldb::SBDebugger debugger, char**,
-                             lldb::SBCommandReturnObject& result) {
-  try {
-    const auto* settings_ptr = GetSettings();
-    if (settings_ptr == nullptr) {
-      result.Printf("LLC2 plugin is not initialized\n");
-      return false;
-    }
-    terminal_width = debugger.GetTerminalWidth();
+bool BacktraceCmd::RealExecute(lldb::SBDebugger debugger, char** cmd,
+                               lldb::SBCommandReturnObject& result) {
+  const auto bt_settings = ParseBtSettings(cmd);
 
-    auto target = debugger.GetSelectedTarget();
-    if (!target.IsValid()) {
-      result.Printf("No target selected\n");
-      return false;
-    }
-    auto process = target.GetProcess();
-    if (!process.IsValid()) {
-      result.Printf("No process launched\n");
-      return false;
-    }
-    auto thread = process.GetSelectedThread();
-
-    const auto memory_regions = GetProcessMemoryRegions(process, result);
-    for (const auto& memory_region : memory_regions) {
-      const auto length = memory_region.end - memory_region.begin;
-      // TODO : settings.stack_size
-      if (length != settings_ptr->GetRealStackSize()) {
-        continue;
-      }
-
-      auto unwind_registers_ptr =
-          TryFindCoroRegisters(process, result, memory_region);
-      if (unwind_registers_ptr != nullptr) {
-        auto frame = thread.GetSelectedFrame();
-        auto registers = frame.GetRegisters();
-        auto gpr_registers =
-            registers.GetFirstValueByName("General Purpose Registers");
-
-        const auto upd_register = [&gpr_registers, &result](
-                                      const char* reg_name,
-                                      std::int64_t reg_value) {
-          auto reg_sb_value = gpr_registers.GetChildMemberWithName(reg_name);
-
-          lldb::SBData data{};
-          data.SetDataFromSInt64Array(&reg_value, 1);
-
-          const auto prev = reg_sb_value.GetValueAsSigned();
-
-          lldb::SBError error{};
-          reg_sb_value.SetData(data, error);
-          if (!error.Success()) {
-            result.Printf("Failed to update '%s' register\n", reg_name);
-          }
-
-          return prev;
-        };
-
-        const auto& regs = *unwind_registers_ptr;
-        const auto old_rsp = upd_register("rsp", regs.rsp);
-        const auto old_rbp = upd_register("rbp", regs.rbp);
-        const auto old_rip = upd_register("rip", regs.rip);
-
-        frame.SetPC(regs.rip);
-        BacktraceCoroutine(thread, result, false);
-
-        frame = thread.GetSelectedFrame();
-        registers = frame.GetRegisters();
-        gpr_registers =
-            registers.GetFirstValueByName("General Purpose Registers");
-        upd_register("rbp", old_rbp);
-        upd_register("rsp", old_rsp);
-        upd_register("rip", old_rip);
-        frame.SetPC(old_rip);
-      }
-    }
-
-    return true;
-  } catch (const std::exception& ex) {
-    result.Printf("something went wrong: %s\n", ex.what());
+  const auto* settings_ptr = GetSettings();
+  if (settings_ptr == nullptr) {
+    result.Printf("LLC2 plugin is not initialized\n");
     return false;
   }
+  terminal_width = debugger.GetTerminalWidth();
+
+  auto target = debugger.GetSelectedTarget();
+  if (!target.IsValid()) {
+    result.Printf("No target selected\n");
+    return false;
+  }
+  auto process = target.GetProcess();
+  if (!process.IsValid()) {
+    result.Printf("No process launched\n");
+    return false;
+  }
+  auto thread = process.GetSelectedThread();
+
+  const auto memory_regions = GetProcessMemoryRegions(process, result);
+  for (const auto& memory_region : memory_regions) {
+    const auto length = memory_region.end - memory_region.begin;
+    if (length != settings_ptr->GetRealStackSize()) {
+      continue;
+    }
+
+    // this doesn't directly relate to neither stack bottom nor stack top,
+    // not the best name, probably.
+    const auto stack_address = memory_region.begin;
+
+    if (bt_settings.stack_address.value_or(stack_address) != stack_address) {
+      continue;
+    }
+
+    auto unwind_registers_ptr =
+        TryFindCoroRegisters(process, result, memory_region);
+    if (unwind_registers_ptr != nullptr) {
+      auto frame = thread.GetSelectedFrame();
+      auto registers = frame.GetRegisters();
+      auto gpr_registers =
+          registers.GetFirstValueByName("General Purpose Registers");
+
+      const auto upd_register = [&gpr_registers, &result](
+                                    const char* reg_name,
+                                    std::int64_t reg_value) {
+        auto reg_sb_value = gpr_registers.GetChildMemberWithName(reg_name);
+
+        lldb::SBData data{};
+        data.SetDataFromSInt64Array(&reg_value, 1);
+
+        const auto prev = reg_sb_value.GetValueAsSigned();
+
+        lldb::SBError error{};
+        reg_sb_value.SetData(data, error);
+        if (!error.Success()) {
+          result.Printf("Failed to update '%s' register\n", reg_name);
+        }
+
+        return prev;
+      };
+
+      const auto& regs = *unwind_registers_ptr;
+      const auto old_rsp = upd_register("rsp", regs.rsp);
+      const auto old_rbp = upd_register("rbp", regs.rbp);
+      const auto old_rip = upd_register("rip", regs.rip);
+
+      frame.SetPC(regs.rip);
+      BacktraceCoroutine(stack_address, thread, result, bt_settings.full);
+
+      frame = thread.GetSelectedFrame();
+      registers = frame.GetRegisters();
+      gpr_registers =
+          registers.GetFirstValueByName("General Purpose Registers");
+      upd_register("rbp", old_rbp);
+      upd_register("rsp", old_rsp);
+      upd_register("rip", old_rip);
+      frame.SetPC(old_rip);
+    }
+  }
+
+  return true;
 }
 
 }  // namespace llc2

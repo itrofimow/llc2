@@ -5,7 +5,7 @@
 namespace llc2 {
 class InitCmd final : public CmdBase {
  public:
-  bool DoExecute(lldb::SBDebugger, char**,
-                 lldb::SBCommandReturnObject& result) final;
+  bool RealExecute(lldb::SBDebugger, char**,
+                   lldb::SBCommandReturnObject&) final;
 };
 }  // namespace llc2

@@ -15,9 +15,14 @@ bool PluginInitialize(lldb::SBDebugger debugger) {
       "-f              only show coroutines which have this in their trace\n"
       "-t              truncate coroutine stack when this is met\n");
 
-  // TODO : add some options
-  llc2.AddCommand("bt", new llc2::BacktraceCmd{},
-                  "Print backtrace of all currently sleeping coroutines\n");
+  llc2.AddCommand(
+      "bt", new llc2::BacktraceCmd{},
+      "Print backtrace of all currently sleeping coroutines\n"
+      "-f              print full backtrace (with locals and arguments)\n"
+      "-s              only backtrace coroutine with this stack address "
+      "(in hexadecimal base). stack address can be found in output of "
+      "prior 'llc2 bt'\n");
+  
   return true;
 }
 }  // namespace lldb
