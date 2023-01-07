@@ -45,6 +45,7 @@ Now you have a `libllc2.so` and should be able to `plugin load` it into lldb.
 
 ### Limitations
 
+* x86_64 linux only
 * Only works
   with [protected_fixedsize](https://www.boost.org/doc/libs/1_81_0/libs/coroutine2/doc/html/coroutine2/stack/protected_fixedsize.html)
 * Some of `llc2 init` options are completely ignored: `-f`, `-t`. They are hardcoded to uServer-specific values for now.
