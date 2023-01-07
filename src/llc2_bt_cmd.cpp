@@ -185,10 +185,10 @@ std::unique_ptr<UnwindRegisters> TryGetRegistersFromFcontext(
     void* fiber_ptr) {
   constexpr std::size_t kContextDataSize = 0x40;
 
-  // so fiber_ptr is a detail::fcontext_t, which in turn is just a void*.
-  char data[kContextDataSize];
+  char context_data[kContextDataSize];
   lldb::SBError error{};
-  process.ReadMemory(reinterpret_cast<std::uintptr_t>(fiber_ptr), &data,
+  // so fiber_ptr is a detail::fcontext_t, which in turn is just a void*.
+  process.ReadMemory(reinterpret_cast<std::uintptr_t>(fiber_ptr), &context_data,
                      kContextDataSize, error);
   if (!error.Success()) {
     result.Printf("Failed to read fcontext from process memory: %s\n",
@@ -196,12 +196,13 @@ std::unique_ptr<UnwindRegisters> TryGetRegistersFromFcontext(
     return nullptr;
   }
 
-  const auto read_with_offset = [&data](std::size_t offset) {
-    return *reinterpret_cast<std::int64_t*>(&data[offset]);
+  const auto read_with_offset = [&context_data](std::size_t offset) {
+    return *reinterpret_cast<std::int64_t*>(&context_data[offset]);
   };
 
-  // with fcontext fiber_ptr is just the stack pointer
-  const auto rsp = reinterpret_cast<std::int64_t>(fiber_ptr);
+  // with fcontext fiber_ptr is a pointer to context data,
+  // detail::jump_fcontext populate registers from it and sets rsp to it + 0x40
+  const auto rsp = reinterpret_cast<std::int64_t>(fiber_ptr) + kContextDataSize;
   const auto rbp = read_with_offset(0x30);
   const auto rip = read_with_offset(0x38);
 
@@ -211,7 +212,7 @@ std::unique_ptr<UnwindRegisters> TryGetRegistersFromFcontext(
 std::unique_ptr<UnwindRegisters> TryFindCoroRegisters(
     lldb::SBProcess& process, lldb::SBCommandReturnObject& result,
     const RegionInfo& region_info) {
-  // We validated that settings aren't null
+  // We already validated that settings aren't null
   const auto& settings = *GetSettings();
 
   constexpr std::size_t func_alignment = 64;  // alignof( ControlBlock);
@@ -257,20 +258,23 @@ void BacktraceCoroutine(lldb::SBThread& current_thread,
 
   bool has_sleep = false;
   int wrapped_call_frame = num_frames;
+
+  std::vector<lldb::SBStream> frame_descriptions(num_frames);
   for (int i = 0; i < num_frames; ++i) {
     auto frame = current_thread.GetFrameAtIndex(i);
-    const auto* display_name = frame.GetDisplayFunctionName();
+    frame.GetDescription(frame_descriptions[i]);
+
+    const auto* display_name = frame_descriptions[i].GetData();
     if (display_name == nullptr) {
       continue;
     }
 
     const std::string_view display_name_sw{display_name};
-
+    // TODO : this doesn't work reliably for reasons i don't quite understand
     if (display_name_sw.find(kUserverSleepMark) != std::string_view::npos) {
       has_sleep = true;
     }
 
-    // TODO : this doesn't work that well with inlined frames
     if (display_name_sw.find(kUserverWrappedCallImplMark) !=
         std::string_view::npos) {
       wrapped_call_frame = i;
@@ -300,17 +304,17 @@ void BacktraceCoroutine(lldb::SBThread& current_thread,
 
   const auto found_coroutine_title = GetFullWidth("found sleeping coroutine");
   result.AppendMessage(found_coroutine_title.data());
+
+  lldb::SBStream result_stream{};
   for (int i = 0; i < wrapped_call_frame; ++i) {
     auto frame = current_thread.GetFrameAtIndex(i);
-    lldb::SBStream stream{};
-    frame.GetDescription(stream);
-
+    result_stream.Print(frame_descriptions[i].GetData());
     if (full) {
-      dump_variables(frame, stream, true, false);
-      dump_variables(frame, stream, false, true);
+      dump_variables(frame, result_stream, true, false);
+      dump_variables(frame, result_stream, false, true);
     }
-    result.Printf("%s", stream.GetData());
   }
+  result.Printf("%s", result_stream.GetData());
 }
 
 }  // namespace
