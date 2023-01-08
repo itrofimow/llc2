@@ -241,7 +241,7 @@ std::unique_ptr<UnwindRegisters> TryFindCoroRegisters(
   }
 }
 
-std::string GetFullWidth(std::string_view what) {
+std::string GetFullWidth(std::string_view what, bool center) {
   if (what.size() + 2 > terminal_width) {
     return std::string{what};
   }
@@ -249,7 +249,11 @@ std::string GetFullWidth(std::string_view what) {
   const auto num_dashes = (terminal_width - (what.size() + 2)) / 2;
   std::string dashes(num_dashes, '-');
 
-  return dashes + " " + what.data() + " " + dashes;
+  if (center) {
+    return dashes + " " + what.data() + " " + dashes;
+  } else {
+    return std::string{what} + "  " + dashes + dashes;
+  }
 }
 
 void BacktraceCoroutine(std::uintptr_t stack_address,
@@ -271,7 +275,7 @@ void BacktraceCoroutine(std::uintptr_t stack_address,
     }
 
     const std::string_view display_name_sw{display_name};
-    // TODO : this doesn't work reliably for reasons i don't quite understand
+    // TODO : this doesn't always work for reasons i don't quite understand
     if (display_name_sw.find(kUserverSleepMark) != std::string_view::npos) {
       has_sleep = true;
     }
@@ -290,10 +294,10 @@ void BacktraceCoroutine(std::uintptr_t stack_address,
         arguments, locals, false /* statics */, true /* in_scope_only */);
     if (frame_variables.GetSize() > 0) {
       if (arguments) {
-        const auto args_title = GetFullWidth("FRAME ARGUMENTS");
+        const auto args_title = GetFullWidth("FRAME ARGUMENTS", false);
         stream.Printf("%s\n", args_title.data());
       } else if (locals) {
-        const auto locals_title = GetFullWidth("FRAME LOCALS");
+        const auto locals_title = GetFullWidth("FRAME LOCALS", false);
         stream.Printf("%s\n", locals_title.data());
       }
     }
@@ -303,7 +307,8 @@ void BacktraceCoroutine(std::uintptr_t stack_address,
     }
   };
 
-  const auto found_coroutine_title = GetFullWidth("found sleeping coroutine");
+  const auto found_coroutine_title =
+      GetFullWidth("FOUND SLEEPING COROUTINE", true);
   result.AppendMessage(found_coroutine_title.data());
   result.Printf("coro stack address: %p\n",
                 reinterpret_cast<void*>(stack_address));
@@ -356,7 +361,9 @@ void PrintDuration(lldb::SBCommandReturnObject& result, const std::string& name,
                    std::chrono::steady_clock::time_point start,
                    std::chrono::steady_clock::time_point finish) {
   result.Printf(
-      "%s duration: %lu ms\n", name.data(),
+      "%s duration: %lu"
+      "ms\n",
+      name.data(),
       std::chrono::duration_cast<std::chrono::milliseconds>(finish - start)
           .count());
 }
@@ -370,6 +377,84 @@ struct ScopeTimer final {
       : name{std::move(name)}, start{Now()}, result{result} {}
 
   ~ScopeTimer() { PrintDuration(result, name, start, Now()); }
+};
+
+std::int64_t UpdateRegisterValue(lldb::SBValue& general_purpose_registers,
+                                 lldb::SBCommandReturnObject& result,
+                                 const char* reg_name, std::int64_t reg_value) {
+  auto reg_sb_value =
+      general_purpose_registers.GetChildMemberWithName(reg_name);
+
+  lldb::SBData data{};
+  data.SetDataFromSInt64Array(&reg_value, 1);
+
+  const auto prev = reg_sb_value.GetValueAsSigned();
+
+  lldb::SBError error{};
+  reg_sb_value.SetData(data, error);
+  if (!error.Success()) {
+    result.Printf("Failed to update '%s' register\n", reg_name);
+  }
+
+  return prev;
+}
+
+class CurrentFrameRegistersGuard final {
+ public:
+  CurrentFrameRegistersGuard(lldb::SBThread& thread,
+                             lldb::SBCommandReturnObject& result)
+      : thread_{thread}, result_{result} {}
+
+  void ChangeRegisters(const UnwindRegisters& regs) {
+    auto [frame, registers] = GetCurrentFrameRegisters();
+
+    const auto old_regs = UpdateRegs(registers, regs);
+    if (!old_registers_.has_value()) {
+      old_registers_.emplace(old_regs);
+    }
+    frame.SetPC(regs.rip);
+  }
+
+  ~CurrentFrameRegistersGuard() {
+    if (!old_registers_.has_value()) {
+      return;
+    }
+    const auto& old_regs = *old_registers_;
+
+    auto [frame, registers] = GetCurrentFrameRegisters();
+    UpdateRegs(registers, old_regs);
+    frame.SetPC(old_regs.rip);
+  }
+
+ private:
+  struct FrameRegisters final {
+    lldb::SBFrame frame;
+    lldb::SBValue registers;
+  };
+
+  FrameRegisters GetCurrentFrameRegisters() {
+    auto frame = thread_.GetSelectedFrame();
+    auto registers =
+        frame.GetRegisters().GetFirstValueByName("General Purpose Registers");
+
+    return {std::move(frame), std::move(registers)};
+  }
+
+  UnwindRegisters UpdateRegs(lldb::SBValue& lldb_registers,
+                             const UnwindRegisters& regs) {
+    const auto old_rsp =
+        UpdateRegisterValue(lldb_registers, result_, "rsp", regs.rsp);
+    const auto old_rbp =
+        UpdateRegisterValue(lldb_registers, result_, "rbp", regs.rbp);
+    const auto old_rip =
+        UpdateRegisterValue(lldb_registers, result_, "rip", regs.rip);
+
+    return {old_rsp, old_rbp, old_rip};
+  }
+
+  lldb::SBThread& thread_;
+  lldb::SBCommandReturnObject& result_;
+  std::optional<UnwindRegisters> old_registers_;
 };
 
 }  // namespace
@@ -396,17 +481,22 @@ bool BacktraceCmd::RealExecute(lldb::SBDebugger debugger, char** cmd,
     return false;
   }
   auto thread = process.GetSelectedThread();
+  if (!thread.IsValid()) {
+    result.Printf("No thread selected\n");
+    return false;
+  }
 
   ScopeTimer total{result, "llc2 bt"};
+
   const auto memory_regions = GetProcessMemoryRegions(process, result);
+  CurrentFrameRegistersGuard regs_guard{thread, result};
   for (const auto& memory_region : memory_regions) {
     const auto length = memory_region.end - memory_region.begin;
     if (length != settings_ptr->GetRealStackSize()) {
       continue;
     }
 
-    // this doesn't directly relate to neither stack bottom nor stack top,
-    // not the best name, probably.
+    // this doesn't directly relate to neither stack bottom nor stack top
     const auto stack_address = memory_region.begin;
 
     if (bt_settings.stack_address.value_or(stack_address) != stack_address) {
@@ -416,46 +506,9 @@ bool BacktraceCmd::RealExecute(lldb::SBDebugger debugger, char** cmd,
     auto unwind_registers_ptr =
         TryFindCoroRegisters(process, result, memory_region);
     if (unwind_registers_ptr != nullptr) {
-      auto frame = thread.GetSelectedFrame();
-      auto registers = frame.GetRegisters();
-      auto gpr_registers =
-          registers.GetFirstValueByName("General Purpose Registers");
-
-      const auto upd_register = [&gpr_registers, &result](
-                                    const char* reg_name,
-                                    std::int64_t reg_value) {
-        auto reg_sb_value = gpr_registers.GetChildMemberWithName(reg_name);
-
-        lldb::SBData data{};
-        data.SetDataFromSInt64Array(&reg_value, 1);
-
-        const auto prev = reg_sb_value.GetValueAsSigned();
-
-        lldb::SBError error{};
-        reg_sb_value.SetData(data, error);
-        if (!error.Success()) {
-          result.Printf("Failed to update '%s' register\n", reg_name);
-        }
-
-        return prev;
-      };
-
       const auto& regs = *unwind_registers_ptr;
-      const auto old_rsp = upd_register("rsp", regs.rsp);
-      const auto old_rbp = upd_register("rbp", regs.rbp);
-      const auto old_rip = upd_register("rip", regs.rip);
-
-      frame.SetPC(regs.rip);
+      regs_guard.ChangeRegisters(regs);
       BacktraceCoroutine(stack_address, thread, result, bt_settings.full);
-
-      frame = thread.GetSelectedFrame();
-      registers = frame.GetRegisters();
-      gpr_registers =
-          registers.GetFirstValueByName("General Purpose Registers");
-      upd_register("rbp", old_rbp);
-      upd_register("rsp", old_rsp);
-      upd_register("rip", old_rip);
-      frame.SetPC(old_rip);
     }
   }
 
