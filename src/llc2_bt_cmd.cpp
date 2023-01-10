@@ -398,7 +398,8 @@ void BacktraceCoroutine(std::uintptr_t stack_address,
           EndsWith(display_type_name, kTaskContextPointerTypeMark) &&
           !span_info.has_value()) {
         auto task_context = maybe_context_ptr.Dereference();
-        auto span_ptr = task_context.GetChildMemberWithName("parent_span_");
+        auto span_ptr =
+            task_context.GetChildMemberWithName("current_span_within_sleep_");
 
         if (span_ptr.GetValueAsUnsigned() != 0) {
           auto span_impl = span_ptr.Dereference()
@@ -464,7 +465,7 @@ void BacktraceCoroutine(std::uintptr_t stack_address,
 
   if (span_info.has_value()) {
     printed =
-        result.Printf("Parent span (name, span_id, trace_id): %s | %s | %s",
+        result.Printf("Current span (name, span_id, trace_id): %s | %s | %s",
                       span_info->name.data(), span_info->span_id.data(),
                       span_info->trace_id.data());
     result.Printf("\n%s\n", std::string{GetDashesSw(printed)}.data());
