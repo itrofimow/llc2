@@ -384,6 +384,12 @@ void BacktraceCoroutine(std::uintptr_t stack_address,
     const std::string_view display_name_sw{display_name};
     // TODO : this doesn't always work for reasons i don't quite understand
     if (display_name_sw.find(kUserverSleepMark) != std::string_view::npos) {
+      if (i == 0) {
+        // we are somewhere in the process of coroutine going to sleep, this
+        // means it's running right now and is visible in just 'bt', without
+        // llc2. We also might have some things not yet set up, so we skip it.
+        break;
+      }
       has_sleep = true;
 
       auto maybe_context_ptr = frame.FindVariable("this");
