@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -24,9 +25,20 @@ namespace {
 std::uint32_t terminal_width;
 
 constexpr std::string_view kUserverSleepMark =
-    "engine::impl::TaskContext::Sleep";
+    "engine::impl::TaskContext::Sleep(";
 constexpr std::string_view kUserverWrappedCallImplMark =
     "utils::impl::WrappedCallImpl<";
+constexpr std::string_view kTaskContextPointerTypeMark =
+    "engine::impl::TaskContext *";
+
+constexpr std::string_view kLotsOfDashes =
+    "--------------------------------------------------------------------------"
+    "--------------------------------------------------------------------------"
+    "---------------------------------------------------";
+
+constexpr std::string_view GetDashesSw(std::size_t size) {
+  return kLotsOfDashes.substr(0, std::min(kLotsOfDashes.size(), size));
+}
 
 struct RegionInfo final {
   std::uintptr_t begin{};
@@ -53,6 +65,32 @@ std::vector<RegionInfo> GetProcessMemoryRegions(
       [](const auto& lhs, const auto& rhs) { return lhs.begin < rhs.begin; });
   return regions;
 }
+
+std::chrono::steady_clock::time_point Now() {
+  return std::chrono::steady_clock::now();
+}
+
+void PrintDuration(lldb::SBCommandReturnObject& result, const std::string& name,
+                   std::chrono::steady_clock::time_point start,
+                   std::chrono::steady_clock::time_point finish) {
+  result.Printf(
+      "%s duration: %lu"
+      "ms\n",
+      name.data(),
+      std::chrono::duration_cast<std::chrono::milliseconds>(finish - start)
+          .count());
+}
+
+struct ScopeTimer final {
+  std::string name;
+  std::chrono::steady_clock::time_point start;
+  lldb::SBCommandReturnObject& result;
+
+  ScopeTimer(lldb::SBCommandReturnObject& result, std::string name)
+      : name{std::move(name)}, start{Now()}, result{result} {}
+
+  ~ScopeTimer() { PrintDuration(result, name, start, Now()); }
+};
 
 enum class state_t : unsigned int {
   none = 0,
@@ -247,13 +285,74 @@ std::string GetFullWidth(std::string_view what, bool center) {
   }
 
   const auto num_dashes = (terminal_width - (what.size() + 2)) / 2;
-  std::string dashes(num_dashes, '-');
+  std::string result;
+  result.reserve(terminal_width);
 
   if (center) {
-    return dashes + " " + what.data() + " " + dashes;
+    result.append(GetDashesSw(num_dashes))
+        .append(" ")
+        .append(what)
+        .append(" ")
+        .append(GetDashesSw(num_dashes));
   } else {
-    return std::string{what} + "  " + dashes + dashes;
+    result.append(what).append(" ").append(GetDashesSw(num_dashes * 2));
   }
+
+  return result;
+}
+
+bool EndsWith(std::string_view source, std::string_view what) {
+  const auto pos = source.find(what);
+  return pos != std::string_view::npos && pos + what.size() == source.size();
+}
+
+// https://bugs.llvm.org/show_bug.cgi?id=24202
+
+// Clang is not emitting debug information for std::string because it was told
+// that libstdc++ provides it. This is a debug size optimization that GCC
+// apparently doesn't perform.
+//
+// So we read strings by hand to not depend on libstdc++ debug info presence.
+std::optional<std::string> ReadStdString(lldb::SBProcess process,
+                                         std::size_t address,
+                                         lldb::SBCommandReturnObject& result) {
+  // let's hope for the best
+  constexpr std::size_t kBufferSize = sizeof(std::string);
+  constexpr std::size_t kMaxLen = 100;
+
+  if (address == 0) {
+    return std::nullopt;
+  }
+
+  char buffer[kBufferSize]{};
+  lldb::SBError error{};
+  process.ReadMemory(address, buffer, kBufferSize, error);
+  if (!error.Success()) {
+    result.Printf("Failed to read std::string from process memory: %s\n",
+                  error.GetCString());
+    return std::nullopt;
+  }
+
+  const auto* fake_str_ptr = reinterpret_cast<std::string*>(buffer);
+
+  const auto* data = fake_str_ptr->data();
+  const auto size = fake_str_ptr->size();
+  if (size > kMaxLen) {
+    return std::nullopt;
+  }
+
+  std::string result_string{};
+  result_string.resize(size);
+
+  process.ReadMemory(reinterpret_cast<std::uintptr_t>(data),
+                     result_string.data(), size, error);
+  if (!error.Success()) {
+    result.Printf("Failed to read std::string from process memory: %s\n",
+                  error.GetCString());
+    return std::nullopt;
+  }
+
+  return {std::move(result_string)};
 }
 
 void BacktraceCoroutine(std::uintptr_t stack_address,
@@ -265,6 +364,14 @@ void BacktraceCoroutine(std::uintptr_t stack_address,
   int wrapped_call_frame = num_frames;
 
   std::vector<lldb::SBStream> frame_descriptions(num_frames);
+
+  struct SpanInfo final {
+    std::string name;
+    std::string span_id;
+    std::string trace_id;
+  };
+  std::optional<SpanInfo> span_info{};
+
   for (int i = 0; i < num_frames; ++i) {
     auto frame = current_thread.GetFrameAtIndex(i);
     frame.GetDescription(frame_descriptions[i]);
@@ -278,6 +385,41 @@ void BacktraceCoroutine(std::uintptr_t stack_address,
     // TODO : this doesn't always work for reasons i don't quite understand
     if (display_name_sw.find(kUserverSleepMark) != std::string_view::npos) {
       has_sleep = true;
+
+      auto maybe_context_ptr = frame.FindVariable("this");
+      const auto* display_type_name = maybe_context_ptr.GetDisplayTypeName();
+      if (display_type_name != nullptr &&
+          EndsWith(display_type_name, kTaskContextPointerTypeMark) &&
+          !span_info.has_value()) {
+        auto task_context = maybe_context_ptr.Dereference();
+        auto span_ptr = task_context.GetChildMemberWithName("parent_span_");
+
+        if (span_ptr.GetValueAsUnsigned() != 0) {
+          auto span_impl = span_ptr.Dereference()
+                               .GetChildMemberWithName("pimpl_")
+                               .Dereference();
+
+          auto lldb_name = span_impl.GetChildMemberWithName("name_");
+          auto lldb_span_id = span_impl.GetChildMemberWithName("span_id_");
+          auto lldb_trace_id = span_impl.GetChildMemberWithName("trace_id_");
+
+          const auto name_opt =
+              ReadStdString(current_thread.GetProcess(),
+                            lldb_name.AddressOf().GetValueAsUnsigned(), result);
+          const auto span_id_opt = ReadStdString(
+              current_thread.GetProcess(),
+              lldb_span_id.AddressOf().GetValueAsUnsigned(), result);
+          const auto trace_id_opt = ReadStdString(
+              current_thread.GetProcess(),
+              lldb_trace_id.AddressOf().GetValueAsUnsigned(), result);
+
+          const std::string empty_str{"(none)"};
+
+          span_info.emplace(SpanInfo{name_opt.value_or(empty_str),
+                                     span_id_opt.value_or(empty_str),
+                                     trace_id_opt.value_or(empty_str)});
+        }
+      }
     }
 
     if (display_name_sw.find(kUserverWrappedCallImplMark) !=
@@ -310,8 +452,17 @@ void BacktraceCoroutine(std::uintptr_t stack_address,
   const auto found_coroutine_title =
       GetFullWidth("FOUND SLEEPING COROUTINE", true);
   result.AppendMessage(found_coroutine_title.data());
-  result.Printf("coro stack address: %p\n",
-                reinterpret_cast<void*>(stack_address));
+  auto printed = result.Printf("coro stack address: %p",
+                               reinterpret_cast<void*>(stack_address));
+  result.Printf("\n%s\n", std::string{GetDashesSw(printed)}.data());
+
+  if (span_info.has_value()) {
+    printed =
+        result.Printf("Parent span (name, span_id, trace_id): %s | %s | %s",
+                      span_info->name.data(), span_info->span_id.data(),
+                      span_info->trace_id.data());
+    result.Printf("\n%s\n", std::string{GetDashesSw(printed)}.data());
+  }
 
   lldb::SBStream result_stream{};
   for (int i = 0; i < wrapped_call_frame; ++i) {
@@ -352,32 +503,6 @@ BtSettings ParseBtSettings(char** cmd) {
 
   return result;
 }
-
-std::chrono::steady_clock::time_point Now() {
-  return std::chrono::steady_clock::now();
-}
-
-void PrintDuration(lldb::SBCommandReturnObject& result, const std::string& name,
-                   std::chrono::steady_clock::time_point start,
-                   std::chrono::steady_clock::time_point finish) {
-  result.Printf(
-      "%s duration: %lu"
-      "ms\n",
-      name.data(),
-      std::chrono::duration_cast<std::chrono::milliseconds>(finish - start)
-          .count());
-}
-
-struct ScopeTimer final {
-  std::string name;
-  std::chrono::steady_clock::time_point start;
-  lldb::SBCommandReturnObject& result;
-
-  ScopeTimer(lldb::SBCommandReturnObject& result, std::string name)
-      : name{std::move(name)}, start{Now()}, result{result} {}
-
-  ~ScopeTimer() { PrintDuration(result, name, start, Now()); }
-};
 
 std::int64_t UpdateRegisterValue(lldb::SBValue& general_purpose_registers,
                                  lldb::SBCommandReturnObject& result,
@@ -506,6 +631,7 @@ bool BacktraceCmd::RealExecute(lldb::SBDebugger debugger, char** cmd,
     auto unwind_registers_ptr =
         TryFindCoroRegisters(process, result, memory_region);
     if (unwind_registers_ptr != nullptr) {
+      ScopeTimer coro{result, "coro backtrace"};
       const auto& regs = *unwind_registers_ptr;
       regs_guard.ChangeRegisters(regs);
       BacktraceCoroutine(stack_address, thread, result, bt_settings.full);
