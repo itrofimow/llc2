@@ -44,16 +44,23 @@ coro stack address: 0x7fffed37f000
 ... coro frames follow ...
 ```
 
-### Build
+### Build linux
 
 Install lldb development headers (liblldb-XX-dev) of matching lldb version, <br>
 fix include_directories in CMakeLists.txt (yes i was too lazy to automate it) and then <br>
 `mkdir build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make` <br>
 Now you have a `libllc2.so` and should be able to `plugin load` it into lldb.
 
+### Build macos
+
+Install llvm package usage brew `brew install llvm` <br>,
+Next, clone this code and run
+`mkdir build && cd build && cmake -DLLVM_DIR=/usr/local/opt/llvm/lib/cmake/llvm -DCMAKE_BUILD_TYPE=Release .. && make`
+Now you have a `libllc2.dylib` and should be able to `plugin load` at into lldb.
+
 ### Limitations
 
-* x86_64 linux only
+* x86_64 linux and macos
 * Only works
   with [protected_fixedsize](https://www.boost.org/doc/libs/1_81_0/libs/coroutine2/doc/html/coroutine2/stack/protected_fixedsize.html)
 * Some of `llc2 init` options are completely ignored: `-f`, `-t`. They are hardcoded to uServer-specific values for now.

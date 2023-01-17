@@ -174,10 +174,13 @@ struct UnwindRegisters final {
   UnwindRegisters(std::int64_t rsp, std::int64_t rbp, std::int64_t rip)
       : rsp{rsp}, rbp{rbp}, rip{rip} {}
 
+#if __linux__
   UnwindRegisters(const ucontext_t& ucontext)
       : rsp{ucontext.uc_mcontext.gregs[REG_RSP]},
         rbp{ucontext.uc_mcontext.gregs[REG_RBP]},
         rip{ucontext.uc_mcontext.gregs[REG_RIP]} {}
+#endif
+
 };
 
 std::unique_ptr<UnwindRegisters> TryGetRegistersFromUcontext(
@@ -196,7 +199,20 @@ std::unique_ptr<UnwindRegisters> TryGetRegistersFromUcontext(
     return nullptr;
   }
 
+#if __APPLE__
+  _STRUCT_MCONTEXT  data{};
+  process.ReadMemory(reinterpret_cast<std::uintptr_t>(context.uc_mcontext), &data,
+      sizeof(_STRUCT_MCONTEXT), error);
+  if (!error.Success()) {
+    result.Printf("Failed to read ucontext from process memory: %s\n",
+                  error.GetCString());
+    return nullptr;
+  }
+
+  return std::make_unique<UnwindRegisters>(data.__ss.__rsp, data.__ss.__rbp, data.__ss.__rip);
+#elif __linux__
   return std::make_unique<UnwindRegisters>(context);
+#endif
 }
 
 // clang-format off
