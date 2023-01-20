@@ -53,7 +53,7 @@ Now you have a `libllc2.so` and should be able to `plugin load` it into lldb.
 
 ### Build macos
 
-Install llvm package usage brew `brew install llvm`, <br>
+Install llvm package using brew `brew install llvm`, <br>
 next, clone this code and run <br>
 `mkdir build && cd build && cmake -DLLVM_DIR=/usr/local/opt/llvm/lib/cmake/llvm -DCMAKE_BUILD_TYPE=Release .. && make` <br>
 Now you have a `libllc2.dylib` and should be able to `plugin load` at into lldb.
