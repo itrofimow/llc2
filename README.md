@@ -47,15 +47,15 @@ coro stack address: 0x7fffed37f000
 ### Build linux
 
 Install lldb development headers (liblldb-XX-dev) of matching lldb version, <br>
-fix include_directories in CMakeLists.txt (yes i was too lazy to automate it) and then <br>
+next, clone this code and run <br>
 `mkdir build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make` <br>
 Now you have a `libllc2.so` and should be able to `plugin load` it into lldb.
 
 ### Build macos
 
-Install llvm package usage brew `brew install llvm` <br>,
-Next, clone this code and run
-`mkdir build && cd build && cmake -DLLVM_DIR=/usr/local/opt/llvm/lib/cmake/llvm -DCMAKE_BUILD_TYPE=Release .. && make`
+Install llvm package usage brew `brew install llvm`, <br>
+next, clone this code and run <br>
+`mkdir build && cd build && cmake -DLLVM_DIR=/usr/local/opt/llvm/lib/cmake/llvm -DCMAKE_BUILD_TYPE=Release .. && make` <br>
 Now you have a `libllc2.dylib` and should be able to `plugin load` at into lldb.
 
 ### Limitations

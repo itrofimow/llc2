@@ -22,7 +22,7 @@ file(GLOB_RECURSE SOURCES
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
 
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
-	target_link_libraries(${PROJECT_NAME} PRIVATE
-	${LLVM_LIBRARY_DIRS}/liblldb.dylib
-	)
+  target_link_libraries(${PROJECT_NAME} PRIVATE
+  ${LLVM_LIBRARY_DIRS}/liblldb.dylib
+)
 endif()
