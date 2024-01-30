@@ -89,7 +89,16 @@ struct ScopeTimer final {
   ScopeTimer(lldb::SBCommandReturnObject& result, std::string name)
       : name{std::move(name)}, start{Now()}, result{result} {}
 
-  ~ScopeTimer() { PrintDuration(result, name, start, Now()); }
+  ~ScopeTimer() {
+    if (armed_) {
+      PrintDuration(result, name, start, Now());
+    }
+  }
+
+  void Disarm() { armed_ = false; }
+
+ private:
+  bool armed_{true};
 };
 
 enum class state_t : unsigned int {
@@ -180,7 +189,6 @@ struct UnwindRegisters final {
         rbp{ucontext.uc_mcontext.gregs[REG_RBP]},
         rip{ucontext.uc_mcontext.gregs[REG_RIP]} {}
 #endif
-
 };
 
 std::unique_ptr<UnwindRegisters> TryGetRegistersFromUcontext(
@@ -200,16 +208,17 @@ std::unique_ptr<UnwindRegisters> TryGetRegistersFromUcontext(
   }
 
 #if __APPLE__
-  _STRUCT_MCONTEXT  data{};
-  process.ReadMemory(reinterpret_cast<std::uintptr_t>(context.uc_mcontext), &data,
-      sizeof(_STRUCT_MCONTEXT), error);
+  _STRUCT_MCONTEXT data{};
+  process.ReadMemory(reinterpret_cast<std::uintptr_t>(context.uc_mcontext),
+                     &data, sizeof(_STRUCT_MCONTEXT), error);
   if (!error.Success()) {
     result.Printf("Failed to read ucontext from process memory: %s\n",
                   error.GetCString());
     return nullptr;
   }
 
-  return std::make_unique<UnwindRegisters>(data.__ss.__rsp, data.__ss.__rbp, data.__ss.__rip);
+  return std::make_unique<UnwindRegisters>(data.__ss.__rsp, data.__ss.__rbp,
+                                           data.__ss.__rip);
 #elif __linux__
   return std::make_unique<UnwindRegisters>(context);
 #endif
@@ -371,7 +380,7 @@ std::optional<std::string> ReadStdString(lldb::SBProcess process,
   return {std::move(result_string)};
 }
 
-void BacktraceCoroutine(std::uintptr_t stack_address,
+bool BacktraceCoroutine(std::uintptr_t stack_address,
                         lldb::SBThread& current_thread,
                         lldb::SBCommandReturnObject& result, bool full) {
   const auto num_frames = current_thread.GetNumFrames();
@@ -451,7 +460,7 @@ void BacktraceCoroutine(std::uintptr_t stack_address,
       break;
     }
   }
-  if (!has_sleep) return;
+  if (!has_sleep) return false;
 
   const auto dump_variables = [](lldb::SBFrame& frame, lldb::SBStream& stream,
                                  bool arguments, bool locals) {
@@ -497,6 +506,8 @@ void BacktraceCoroutine(std::uintptr_t stack_address,
     }
   }
   result.Printf("%s", result_stream.GetData());
+
+  return true;
 }
 
 struct BtSettings final {
@@ -634,7 +645,7 @@ bool BacktraceCmd::RealExecute(lldb::SBDebugger debugger, char** cmd,
     return false;
   }
 
-  ScopeTimer total{result, "llc2 bt"};
+  const ScopeTimer total{result, "llc2 bt"};
 
   const auto memory_regions = GetProcessMemoryRegions(process, result);
   CurrentFrameRegistersGuard regs_guard{thread, result};
@@ -654,10 +665,13 @@ bool BacktraceCmd::RealExecute(lldb::SBDebugger debugger, char** cmd,
     auto unwind_registers_ptr =
         TryFindCoroRegisters(process, result, memory_region);
     if (unwind_registers_ptr != nullptr) {
-      ScopeTimer coro{result, "coro backtrace"};
+      ScopeTimer coro_bt_timer{result, "coro backtrace"};
       const auto& regs = *unwind_registers_ptr;
       regs_guard.ChangeRegisters(regs);
-      BacktraceCoroutine(stack_address, thread, result, bt_settings.full);
+      if (!BacktraceCoroutine(stack_address, thread, result,
+                              bt_settings.full)) {
+        coro_bt_timer.Disarm();
+      }
     }
   }
 
